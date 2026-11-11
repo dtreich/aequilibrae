@@ -596,3 +596,114 @@ def test_SF_skimming_02(network_setup):
 
     # Only board once
     np.testing.assert_allclose(mats["boardings"], mats["alightings"])
+
+
+def _rect_setup(n=10):
+    """Bell network with distinct origin (first row) and destination (last row) vertices.
+
+    Edges run +x and +y only, so origin column i reaches destination column j iff j >= i.
+    """
+    edges = create_edges(n, seed=124)
+    delay_base = edges.delay_base.to_numpy(copy=True)
+    zero = delay_base == 0.0
+    delay_base[zero] = 1.0
+    freq = 1.0 / delay_base / 10.0
+    freq[zero] = np.inf
+    edges["freq"] = freq
+    edges["n_edges"] = 1.0
+    nodes_to_indices = np.arange(n * n, dtype="int64")
+    origins = np.arange(n, dtype="int64")
+    destinations = np.arange(n * (n - 1), n * n, dtype="int64")
+    return edges, nodes_to_indices, origins, destinations
+
+
+def _rect_hp(edges, nodes_to_indices, origins, destinations):
+    return HyperpathGenerating(
+        edges,
+        skim_cols=["trav_time", "n_edges"],
+        o_vert_ids=origins,
+        d_vert_ids=destinations,
+        nodes_to_indices=nodes_to_indices,
+    )
+
+
+def test_skim_destinations_matches_square_skim():
+    edges, n2i, origins, destinations = _rect_setup()
+    hp = _rect_hp(edges, n2i, origins, destinations)
+    empty_u, empty_f = np.array([], dtype=np.uint32), np.array([], dtype=np.float64)
+    hp.assign(empty_u, empty_u, empty_f, threads=2)
+    square = hp.skim_matrix
+    full = np.dstack([square.matrix[c] for c in ["trav_time", "n_edges"]])
+    np.testing.assert_array_equal(full[:, :, 0] > 0, np.triu(np.ones((10, 10), dtype=bool)))
+
+    batches = [destinations[:3], destinations[3:4], destinations[4:]]
+    cols = []
+    for batch in batches:
+        hp.assign(empty_u, empty_u, empty_f, threads=2, skim_destinations=batch)
+        assert isinstance(hp.skim_matrix, np.ndarray)
+        assert hp.skim_matrix.shape == (len(origins), len(batch), 2)
+        assert hp.skim_matrix_names == ["trav_time", "n_edges"]
+        cols.append(hp.skim_matrix)
+    np.testing.assert_array_equal(np.concatenate(cols, axis=1), full)
+
+    # an unordered subset maps columns in the order given
+    batch = destinations[[7, 2, 5]]
+    hp.assign(empty_u, empty_u, empty_f, threads=1, skim_destinations=batch)
+    np.testing.assert_array_equal(hp.skim_matrix, full[:, [7, 2, 5], :])
+
+
+def test_skim_destinations_with_demand_matches_stock_volumes():
+    edges, n2i, origins, destinations = _rect_setup()
+    o = np.repeat(origins[:4], 2).astype(np.uint32)
+    d = np.tile(destinations[[1, 6]], 4).astype(np.uint32)
+    v = np.linspace(1.0, 8.0, len(o))
+
+    stock = _rect_hp(edges, n2i, origins, destinations)
+    stock.assign(o, d, v, threads=2)
+    stock_full = np.dstack([stock.skim_matrix.matrix[c] for c in ["trav_time", "n_edges"]])
+
+    hp = _rect_hp(edges, n2i, origins, destinations)
+    batch = destinations[[0, 1, 6]]
+    hp.assign(o, d, v, threads=2, skim_destinations=batch)
+    np.testing.assert_allclose(hp._edges["volume"].values, stock._edges["volume"].values, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(hp.skim_matrix, stock_full[:, [0, 1, 6], :])
+
+
+def test_skim_destinations_masks_origins_independently():
+    """A disconnected origin keeps its row (zero) and does not drop its paired destination."""
+    edges, n2i, origins, destinations = _rect_setup()
+    n2i = np.append(n2i, -1)  # vertex id 100 is not in the graph
+    origins = origins.copy()
+    origins[3] = 100
+    hp = _rect_hp(edges, n2i, origins, destinations)
+    empty_u, empty_f = np.array([], dtype=np.uint32), np.array([], dtype=np.float64)
+    hp.assign(empty_u, empty_u, empty_f, threads=1, skim_destinations=destinations)
+    reach = np.triu(np.ones((10, 10), dtype=bool))
+    reach[3] = False
+    np.testing.assert_array_equal(hp.skim_matrix[:, :, 0] > 0, reach)  # column 3 survives
+
+
+def test_skim_destinations_refusals():
+    edges, n2i, origins, destinations = _rect_setup()
+    hp = _rect_hp(edges, n2i, origins, destinations)
+    empty_u, empty_f = np.array([], dtype=np.uint32), np.array([], dtype=np.float64)
+
+    with pytest.raises(ValueError, match="every demand destination"):
+        hp.assign(
+            np.array([0], dtype=np.uint32),
+            np.array([destinations[5]], dtype=np.uint32),
+            np.array([1.0]),
+            skim_destinations=destinations[:3],
+        )
+    with pytest.raises(ValueError, match="subset of d_vert_ids"):
+        hp.assign(empty_u, empty_u, empty_f, skim_destinations=np.array([50]))
+    with pytest.raises(ValueError, match="distinct vertex ids"):
+        hp.assign(empty_u, empty_u, empty_f, skim_destinations=destinations[[0, 0]])
+
+    shared = _rect_hp(edges, n2i, origins, np.r_[origins[:1], destinations[1:]])
+    with pytest.raises(ValueError, match="distinct"):
+        shared.assign(empty_u, empty_u, empty_f, skim_destinations=origins[:1])
+
+    no_skims = HyperpathGenerating(edges, o_vert_ids=origins, d_vert_ids=destinations, nodes_to_indices=n2i)
+    with pytest.raises(ValueError, match="needs skim_cols"):
+        no_skims.assign(empty_u, empty_u, empty_f, skim_destinations=destinations[:2])

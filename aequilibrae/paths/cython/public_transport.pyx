@@ -249,7 +249,8 @@ class HyperpathGenerating:
         destination_column,
         demand_column,
         check_demand=False,
-        threads=None
+        threads=None,
+        skim_destinations=None,
     ):
         """
         Assigns demand to the edges of the graph.
@@ -272,6 +273,12 @@ class HyperpathGenerating:
             **threads** (:obj:`int`, optional): The number of threads to use for computation. 
             Default is ``0`` (using all available threads).
 
+            **skim_destinations** (:obj:`np.ndarray`, optional): Skim only these destination vertices (a subset
+            of ``d_vert_ids``). The skim is then rectangular, ``(len(o_vert_ids), len(skim_destinations), n_cols)``,
+            and ``skim_matrix`` is a plain :obj:`np.ndarray` with its names in ``skim_matrix_names``. Every demand
+            destination must be in the subset, and the origin and destination vertices must be distinct. Lets a
+            caller batch destinations to bound skim memory. Default is ``None`` (skim every destination).
+
         """
 
         self.origin_column = origin_column.astype(np.uint32)
@@ -292,7 +299,11 @@ class HyperpathGenerating:
 
         # get the list of all destinations, we use "rest of" for skimming
         destinations = np.unique(self.destination_column)
-        if self._skimming:
+        if skim_destinations is not None:
+            rest_of_destinations, o_indices, od_index_to_taz_index = self._skim_subset(
+                np.asarray(skim_destinations), destinations
+            )
+        elif self._skimming:
             rest_of_destinations = self._d_vert_ids[
                 np.isin(self._d_vert_ids, destinations, invert=True, assume_unique=True)
             ].astype("uint32")
@@ -306,7 +317,12 @@ class HyperpathGenerating:
             skim_cols = [self._trav_time_name] + skim_cols
             n_skim_cols = n_skim_cols + 1
 
-        self.skim_matrix = np.zeros((n_centroids, n_centroids, n_skim_cols))
+        if skim_destinations is None:
+            o_indices = self._o_indices
+            od_index_to_taz_index = self._od_index_to_taz_index
+            self.skim_matrix = np.zeros((n_centroids, n_centroids, n_skim_cols))
+        else:
+            self.skim_matrix = np.zeros((n_centroids, len(skim_destinations), n_skim_cols))
 
         compute_SF_in_parallel(
             self._indptr[:],
@@ -328,8 +344,8 @@ class HyperpathGenerating:
             self.u_i_vec,
             self.skim_matrix,
             self._o_vert_ids[:],
-            self._o_indices[:],
-            self._od_index_to_taz_index[:],
+            o_indices[:],
+            od_index_to_taz_index[:],
             self._nodes_to_indices[:],
             self._skimming,
             self._is_travel_time,
@@ -357,6 +373,11 @@ class HyperpathGenerating:
             else:
                 arr = self.skim_matrix
 
+            if skim_destinations is not None:
+                self.skim_matrix = np.ascontiguousarray(arr)
+                self.skim_matrix_names = skim_cols
+                return
+
             self.skim_matrix = AequilibraeMatrix()
             self.skim_matrix.create_empty(zones=len(self._o_vert_ids), matrix_names=skim_cols)
             self.skim_matrix.index[:] = self._o_vert_ids
@@ -366,6 +387,40 @@ class HyperpathGenerating:
 
         else:
             self.skim_matrix = None
+
+    def _skim_subset(self, skim_destinations, demand_destinations):
+        """Row and column maps for a rectangular skim over ``skim_destinations``.
+
+        Rows follow ``o_vert_ids`` and columns follow ``skim_destinations``. Origins and destinations are masked
+        independently, so a disconnected origin does not drop a destination. Both maps share one array indexed by
+        vertex, so the origin and destination vertices must be distinct.
+        """
+        if not self._skimming:
+            raise ValueError("skim_destinations needs skim_cols")
+        if skim_destinations.ndim != 1 or len(np.unique(skim_destinations)) != len(skim_destinations):
+            raise ValueError("skim_destinations must be a 1-D array of distinct vertex ids")
+        if not np.isin(skim_destinations, self._d_vert_ids).all():
+            raise ValueError("skim_destinations must be a subset of d_vert_ids")
+        # The kernel writes skims without bounds checks: a demand destination outside the subset would write to
+        # column -1. Refuse it.
+        if not np.isin(demand_destinations, skim_destinations).all():
+            raise ValueError("every demand destination must be in skim_destinations")
+
+        o_idx = self._nodes_to_indices[self._o_vert_ids]
+        d_idx = self._nodes_to_indices[skim_destinations]
+        o_ok = o_idx != -1
+        d_ok = d_idx != -1
+        if np.isin(o_idx[o_ok], d_idx[d_ok]).any():
+            raise ValueError("skim_destinations needs origin and destination vertices to be distinct")
+
+        od_index_to_taz_index = np.full(self.vertex_count, -1, dtype="int64")
+        od_index_to_taz_index[o_idx[o_ok]] = np.arange(len(o_idx))[o_ok]
+        od_index_to_taz_index[d_idx[d_ok]] = np.arange(len(d_idx))[d_ok]
+
+        rest_of_destinations = skim_destinations[
+            np.isin(skim_destinations, demand_destinations, invert=True)
+        ].astype("uint32")
+        return rest_of_destinations, o_idx[o_ok].astype("uint32"), od_index_to_taz_index
 
     def _check_demand(self, origin_column, destination_column, demand_column):
         for col, col_name in zip(
